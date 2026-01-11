@@ -1,207 +1,263 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+import cv2
+import numpy as np
+import threading
+import time
+import tkinter as tk
+import random
+from datetime import datetime
+from threading import Thread, Event
 
-# C extensions
-*.so
+# ------------------ CONFIG ------------------
+CAM_INDEX = 0                # camera index (0,1,...)
+RESIZE_WIDTH = 640           # None or an int (lower -> faster)
+AREA_THRESHOLD = 3000        # sum of contour areas threshold (tune)
+DIFF_PIXEL_THRESHOLD = 3000  # fast frame-diff pixel threshold (tune)
+COOLDOWN_SECONDS = 4
+BG_HISTORY = 700
+BG_VAR_THRESHOLD = 60
+CURTAIN_IGNORE_TOP_RATIO = 0.25  # ignore top 25% (curtain area)
+BLUR_SIZE = (3, 3)
+FLOW_USE = False             # optical flow (CPU heavy)
+FLOW_THRESHOLD = 1.6
+SHOW_FEED = True             # <<--- FEED VISIBLE (you wanted the feed shown)
+CAP_DSHOW = True             # use DirectShow on Windows (fixes some camera issues)
+# ------------------------------------------
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+stop_event = Event()
+fullscreen_open = Event()
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# ---------- Threaded camera capture ----------
+class CameraStream:
+    def __init__(self, src=0, cap_dshow=True):
+        if cap_dshow:
+            self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+        else:
+            self.cap = cv2.VideoCapture(src)
+        self.ret, self.frame = self.cap.read()
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = Thread(target=self.update, daemon=True)
+        self.thread.start()
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+    def update(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            with self.lock:
+                self.ret = ret
+                self.frame = frame
+            # tiny sleep reduces CPU but keeps it fresh
+            time.sleep(0.001)
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py.cover
-.hypothesis/
-.pytest_cache/
-cover/
+    def read(self):
+        with self.lock:
+            return self.ret, None if self.frame is None else self.frame.copy()
 
-# Translations
-*.mo
-*.pot
+    def stop(self):
+        self.running = False
+        try:
+            self.cap.release()
+        except:
+            pass
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+# ---------- Matrix full-screen (endless) ----------
+def open_fullscreen_matrix():
+    if fullscreen_open.is_set():
+        return
+    fullscreen_open.set()
 
-# Flask stuff:
-instance/
-.webassets-cache
+    def on_escape(event=None):
+        try:
+            root.destroy()
+        except:
+            pass
+        fullscreen_open.clear()
 
-# Scrapy stuff:
-.scrapy
+    root = tk.Tk()
+    root.title("Matrix")
+    root.configure(bg='black')
+    root.attributes("-fullscreen", True)
+    root.bind("<Escape>", on_escape)
 
-# Sphinx documentation
-docs/_build/
+    txt = tk.Text(root, bg='black', fg='#33FF33', insertbackground='#33FF33',
+                  font=("Consolas", 16), bd=0)
+    txt.pack(fill='both', expand=True)
+    txt.configure(state='disabled')
 
-# PyBuilder
-.pybuilder/
-target/
+    def stream_once():
+        if not fullscreen_open.is_set():
+            return
+        snippets = [
+            "echo $RANDOM", "sudo apt-get update", "git pull origin main",
+            "for i in range(0xFFFF):", "    process_packet()", "memdump(0x400000)",
+            "0x{:06X} -> 0x{:06X}".format(random.randint(0, 16**6), random.randint(0, 16**6)),
+            "// sync", "auth.check()", "alloc(1024*64)", ">>> kernel: ok"
+        ]
+        r = random.random()
+        if r < 0.75:
+            line = random.choice(snippets)
+        elif r < 0.95:
+            line = f"// {random.choice(['tick','proc','sync','auth'])} {random.randint(0,99999)}"
+        else:
+            line = f"0x{random.randint(0, 16**6):06X} -> 0x{random.randint(0, 16**6):06X}"
+        if random.random() < 0.02:
+            line = f"# {datetime.now().strftime('%H:%M:%S')} | motion_event"
+        txt.configure(state='normal')
+        txt.insert('end', line + "\n")
+        # keep buffer manageable
+        try:
+            if int(txt.index('end-1c').split('.')[0]) > 10000:
+                txt.delete('1.0', '2.0')
+        except:
+            pass
+        txt.see('end')
+        txt.configure(state='disabled')
+        root.after(random.randint(8, 40), stream_once)  # very fast for hacker vibe
 
-# Jupyter Notebook
-.ipynb_checkpoints
+    root.after(50, stream_once)
+    try:
+        root.mainloop()
+    finally:
+        fullscreen_open.clear()
 
-# IPython
-profile_default/
-ipython_config.py
+# ---------- Main detector ----------
+def detector_loop():
+    stream = CameraStream(CAM_INDEX, cap_dshow=CAP_DSHOW)
+    ret, frame = stream.read()
+    if not ret or frame is None:
+        print("❌ Camera not available. Close other apps using the camera or change CAM_INDEX.")
+        stream.stop()
+        return
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
+    # target resize for speed
+    if RESIZE_WIDTH:
+        h, w = frame.shape[:2]
+        scale = RESIZE_WIDTH / float(w)
+        target_size = (RESIZE_WIDTH, int(h * scale))
+    else:
+        target_size = None
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+    if target_size:
+        frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA)
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
+    prev_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    prev_gray = cv2.GaussianBlur(prev_gray, BLUR_SIZE, 0)
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
-#poetry.toml
+    fgbg = cv2.createBackgroundSubtractorMOG2(history=BG_HISTORY, varThreshold=BG_VAR_THRESHOLD, detectShadows=True)
+    last_trigger = 0
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
-#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
-#pdm.lock
-#pdm.toml
-.pdm-python
-.pdm-build/
+    # prepare window
+    if SHOW_FEED:
+        win_name = "Live Motion Feed"
+        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+        # do not force topmost (so it doesn't steal focus), but you can move/resize it
+        try:
+            cv2.resizeWindow(win_name, 800, 600)
+        except:
+            pass
 
-# pixi
-#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
-#pixi.lock
-#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
-#   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi
+    print(f"▶ Detector running (feed visible = {SHOW_FEED}). Press 'q' in the feed to quit.")
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+    while not stop_event.is_set():
+        ret, frame = stream.read()
+        if not ret or frame is None:
+            time.sleep(0.01)
+            continue
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+        if target_size:
+            frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA)
 
-# SageMath parsed files
-*.sage.py
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, BLUR_SIZE, 0)
 
-# Environments
-.env
-.envrc
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+        # mask to ignore curtain/top area
+        mask = np.ones_like(gray) * 255
+        h, w = gray.shape
+        top_cut = int(h * CURTAIN_IGNORE_TOP_RATIO)
+        cv2.rectangle(mask, (0, 0), (w, top_cut), 0, -1)
 
-# Spyder project settings
-.spyderproject
-.spyproject
+        # background subtraction detection (slow-moving / mid-speed)
+        fgmask = fgbg.apply(gray)
+        fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)))
+        fgmask = cv2.dilate(fgmask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)), iterations=1)
+        fgmask = cv2.bitwise_and(fgmask, mask)
 
-# Rope project settings
-.ropeproject
+        contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour_boxes = []
+        total_area = 0
+        for c in contours:
+            a = cv2.contourArea(c)
+            if a < 50:
+                continue
+            total_area += a
+            x, y, wc, hc = cv2.boundingRect(c)
+            contour_boxes.append((x, y, wc, hc, a))
 
-# mkdocs documentation
-/site
+        # frame differencing for very fast motion
+        diff = cv2.absdiff(prev_gray, gray)
+        _, diff_th = cv2.threshold(diff, 20, 255, cv2.THRESH_BINARY)
+        diff_th = cv2.bitwise_and(diff_th, mask)
+        motion_pixels = int(np.sum(diff_th) / 255)
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
+        # optional optical flow
+        mean_flow = 0.0
+        if FLOW_USE:
+            flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
+                                                pyr_scale=0.5, levels=3, winsize=15,
+                                                iterations=2, poly_n=5, poly_sigma=1.1, flags=0)
+            mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+            mean_flow = float(np.mean(mag))
 
-# Pyre type checker
-.pyre/
+        now = time.time()
+        fast_flag = motion_pixels > DIFF_PIXEL_THRESHOLD
+        bg_flag = total_area > AREA_THRESHOLD
+        flow_flag = FLOW_USE and (mean_flow > FLOW_THRESHOLD)
 
-# pytype static type analyzer
-.pytype/
+        motion_flag = (fast_flag or bg_flag or flow_flag) and ((now - last_trigger) > COOLDOWN_SECONDS) and (not fullscreen_open.is_set())
 
-# Cython debug symbols
-cython_debug/
+        # draw the live feed and green boxes
+        display = frame.copy()
+        for (x, y, wc, hc, a) in contour_boxes:
+            if a < 200:
+                continue
+            cv2.rectangle(display, (x, y), (x + wc, y + hc), (0, 255, 0), 2)
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+        info = f"AREA:{int(total_area)} DIFF_PIX:{motion_pixels} FLOW:{mean_flow:.2f}"
+        cv2.putText(display, info, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        if fast_flag:
+            cv2.putText(display, "FAST MOTION", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        if bg_flag:
+            cv2.putText(display, "FG MOTION", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
+        if SHOW_FEED:
+            cv2.imshow(win_name, display)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                stop_event.set()
+                break
+            elif key == ord('f'):
+                if not fullscreen_open.is_set():
+                    Thread(target=open_fullscreen_matrix, daemon=True).start()
+        else:
+            # when feed is hidden you must stop via Ctrl+C in terminal
+            key = None
 
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+        if motion_flag:
+            last_trigger = now
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] TRIGGER! area={int(total_area)} diff_pixels={motion_pixels} flow={mean_flow:.2f}")
+            Thread(target=open_fullscreen_matrix, daemon=True).start()
 
-# Ruff stuff:
-.ruff_cache/
+        prev_gray = gray
+        # tiny sleep (keeps CPU sane)
+        time.sleep(0.005)
 
-# PyPI configuration file
-.pypirc
+    stream.stop()
+    if SHOW_FEED:
+        cv2.destroyAllWindows()
+    print("Detector stopped.")
 
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
-.cursorindexingignore
-
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
+if __name__ == "__main__":
+    try:
+        detector_loop()
+    except KeyboardInterrupt:
+        stop_event.set()
+        print("Interrupted by user.")
